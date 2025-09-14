@@ -138,8 +138,14 @@ if __name__ == "__main__":
     parser.add_argument("--lora_name", type=str, default="lora_medical", help="根据任务保存成lora_(英文/医学/心理...)")
     args = parser.parse_args()
 
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               use_moe=args.use_moe)
+    lm_config = MiniMindConfig(
+        hidden_size=args.hidden_size, 
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=args.use_moe,
+        use_hierarchical_moe=getattr(args, 'use_hierarchical_moe', True),
+        num_l1_experts=getattr(args, 'num_l1_experts', 4),
+        num_l2_experts_per_group=getattr(args, 'num_l2_experts_per_group', 4)
+    )
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)

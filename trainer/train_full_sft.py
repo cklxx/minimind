@@ -94,12 +94,13 @@ def train_epoch(epoch, wandb):
 
 
 def init_model(lm_config):
-    tokenizer = AutoTokenizer.from_pretrained('../model')
+    tokenizer = AutoTokenizer.from_pretrained('./model')
     model = MiniMindForCausalLM(lm_config)
-    moe_path = '_moe' if lm_config.use_moe else ''
-    ckp = f'{args.save_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
-    state_dict = torch.load(ckp, map_location=args.device)
-    model.load_state_dict(state_dict, strict=False)
+    # For testing hierarchical MoE, initialize from scratch
+    # moe_path = '_moe' if lm_config.use_moe else ''
+    # ckp = f'{args.save_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
+    # state_dict = torch.load(ckp, map_location=args.device)
+    # model.load_state_dict(state_dict, strict=False)
 
     Logger(f'LLM可训练总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     model = model.to(args.device)
@@ -144,8 +145,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               use_moe=args.use_moe)
+    lm_config = MiniMindConfig(
+        hidden_size=args.hidden_size, 
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=args.use_moe,
+        use_hierarchical_moe=getattr(args, 'use_hierarchical_moe', True),
+        num_l1_experts=getattr(args, 'num_l1_experts', 4),
+        num_l2_experts_per_group=getattr(args, 'num_l2_experts_per_group', 4)
+    )
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -177,7 +184,7 @@ if __name__ == "__main__":
         wandb = None
 
     model, tokenizer = init_model(lm_config)
-
+    
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None
     train_loader = DataLoader(

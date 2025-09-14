@@ -36,6 +36,14 @@ class MiniMindConfig(PretrainedConfig):
             aux_loss_alpha: float = 0.1,
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
+            ####################################################
+            # Hierarchical MoE specific configurations
+            ####################################################
+            use_hierarchical_moe: bool = True,
+            num_l1_experts: int = 4,
+            num_l2_experts_per_group: int = 4,
+            l1_aux_loss_alpha: float = 0.05,
+            l2_aux_loss_alpha: float = 0.05,
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -65,6 +73,14 @@ class MiniMindConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+        ####################################################
+        # Hierarchical MoE specific configurations
+        ####################################################
+        self.use_hierarchical_moe = use_hierarchical_moe  # 是否使用层级MoE
+        self.num_l1_experts = num_l1_experts  # L1专家组数量
+        self.num_l2_experts_per_group = num_l2_experts_per_group  # 每个L1组内的L2专家数量
+        self.l1_aux_loss_alpha = l1_aux_loss_alpha  # L1层级的辅助损失权重
+        self.l2_aux_loss_alpha = l2_aux_loss_alpha  # L2层级的辅助损失权重
 
 
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
@@ -334,6 +350,268 @@ class MOEFeedForward(nn.Module):
         return expert_cache
 
 
+class Level2MoEGate(nn.Module):
+    def __init__(self, config: MiniMindConfig, num_experts: int = 4):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = num_experts
+        
+        self.scoring_func = config.scoring_func
+        self.alpha = config.l2_aux_loss_alpha
+        self.seq_aux = config.seq_aux
+        
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        self.reset_parameters()
+    
+    def reset_parameters(self) -> None:
+        import torch.nn.init as init
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    
+    def forward(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+        logits = F.linear(hidden_states, self.weight, None)
+        if self.scoring_func == 'softmax':
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
+
+        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            aux_topk = self.top_k
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            if self.seq_aux:
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                ce.scatter_add_(1, topk_idx_for_aux_loss,
+                                torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
+                    seq_len * aux_topk / self.n_routed_experts)
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+            else:
+                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                ce = mask_ce.float().mean(0)
+                Pi = scores_for_aux.mean(0)
+                fi = ce * self.n_routed_experts
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = 0
+        return topk_idx, topk_weight, aux_loss
+
+
+class Level2MoE(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.num_experts = config.num_l2_experts_per_group
+        
+        self.experts = nn.ModuleList([
+            FeedForward(config)
+            for _ in range(self.num_experts)
+        ])
+        self.gate = Level2MoEGate(config, self.num_experts)
+    
+    def forward(self, x):
+        orig_shape = x.shape
+        bsz, seq_len, _ = x.shape
+        
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+        x = x.view(-1, x.shape[-1])
+        flat_topk_idx = topk_idx.view(-1)
+        
+        if self.training:
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            y = torch.empty_like(x, dtype=torch.float16)
+            for i, expert in enumerate(self.experts):
+                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.view(*orig_shape)
+        else:
+            y = self.l2_moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+        
+        return y, aux_loss
+    
+    @torch.no_grad()
+    def l2_moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        expert_cache = torch.zeros_like(x)
+        idxs = flat_expert_indices.argsort()
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        token_idxs = idxs // self.config.num_experts_per_tok
+        
+        for i, end_idx in enumerate(tokens_per_expert):
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            expert = self.experts[i]
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            expert_tokens = x[exp_token_idx]
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+        
+        return expert_cache
+
+
+class HierarchicalMoEGate(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.num_l1_experts
+        
+        self.scoring_func = config.scoring_func
+        self.alpha = config.l1_aux_loss_alpha
+        self.seq_aux = config.seq_aux
+        
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        self.reset_parameters()
+    
+    def reset_parameters(self) -> None:
+        import torch.nn.init as init
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    
+    def forward(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+        logits = F.linear(hidden_states, self.weight, None)
+        if self.scoring_func == 'softmax':
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
+
+        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            aux_topk = self.top_k
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            if self.seq_aux:
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                ce.scatter_add_(1, topk_idx_for_aux_loss,
+                                torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
+                    seq_len * aux_topk / self.n_routed_experts)
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+            else:
+                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                ce = mask_ce.float().mean(0)
+                Pi = scores_for_aux.mean(0)
+                fi = ce * self.n_routed_experts
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = 0
+        return topk_idx, topk_weight, aux_loss
+
+
+class HierarchicalMoE(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.num_l1_experts = config.num_l1_experts
+        
+        self.l1_gate = HierarchicalMoEGate(config)
+        self.l1_expert_groups = nn.ModuleList([
+            Level2MoE(config) 
+            for _ in range(self.num_l1_experts)
+        ])
+        
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList([
+                FeedForward(config)
+                for _ in range(config.n_shared_experts)
+            ])
+    
+    def forward(self, x):
+        identity = x
+        orig_shape = x.shape
+        
+        # L1 routing - get routing weights for all experts
+        l1_topk_idx, l1_topk_weight, l1_aux_loss = self.l1_gate(x)
+        
+        # Compute all expert outputs
+        expert_outputs = []
+        total_l2_aux_loss = 0
+        
+        for expert_group in self.l1_expert_groups:
+            group_output, l2_aux_loss = expert_group(x)
+            expert_outputs.append(group_output)
+            total_l2_aux_loss += l2_aux_loss
+        
+        # Stack expert outputs: [num_experts, batch, seq, hidden]
+        stacked_outputs = torch.stack(expert_outputs, dim=0)
+        
+        # Create routing weights matrix: [batch, seq, num_experts]
+        routing_weights = torch.zeros(orig_shape[0], orig_shape[1], self.num_l1_experts, 
+                                    device=x.device, dtype=x.dtype)
+        
+        # Fill in the routing weights based on top-k selection
+        # l1_topk_idx shape: [batch*seq, top_k], l1_topk_weight shape: [batch*seq, top_k]
+        l1_topk_idx = l1_topk_idx.view(orig_shape[0], orig_shape[1], -1)  # [batch, seq, top_k]
+        l1_topk_weight = l1_topk_weight.view(orig_shape[0], orig_shape[1], -1)  # [batch, seq, top_k]
+        
+        for batch_idx in range(orig_shape[0]):
+            for seq_idx in range(orig_shape[1]):
+                for k in range(self.config.num_experts_per_tok):
+                    expert_idx = l1_topk_idx[batch_idx, seq_idx, k]
+                    weight = l1_topk_weight[batch_idx, seq_idx, k]
+                    routing_weights[batch_idx, seq_idx, expert_idx] += weight
+        
+        # Apply routing: weighted sum over experts
+        # routing_weights: [batch, seq, num_experts] -> [batch, seq, num_experts, 1]
+        # stacked_outputs: [num_experts, batch, seq, hidden] -> [batch, seq, num_experts, hidden]
+        routing_weights = routing_weights.unsqueeze(-1)  # [batch, seq, num_experts, 1]
+        stacked_outputs = stacked_outputs.permute(1, 2, 0, 3)  # [batch, seq, num_experts, hidden]
+        
+        y = (routing_weights * stacked_outputs).sum(dim=2)  # [batch, seq, hidden]
+        
+        if self.config.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                y = y + expert(identity)
+        
+        total_aux_loss = l1_aux_loss + total_l2_aux_loss
+        self.aux_loss = total_aux_loss
+        return y
+    
+    @torch.no_grad()
+    def hierarchical_moe_infer(self, x, flat_l1_expert_indices, flat_l1_expert_weights, orig_shape):
+        expert_cache = torch.zeros_like(x)
+        idxs = flat_l1_expert_indices.argsort()
+        tokens_per_l1_expert = flat_l1_expert_indices.bincount().cpu().numpy().cumsum(0)
+        token_idxs = idxs // self.config.num_experts_per_tok
+        
+        for i, end_idx in enumerate(tokens_per_l1_expert):
+            start_idx = 0 if i == 0 else tokens_per_l1_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            
+            expert_group = self.l1_expert_groups[i]
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            expert_tokens = x[exp_token_idx]
+            
+            expert_tokens_reshaped = expert_tokens.view(-1, orig_shape[1], orig_shape[2])
+            expert_out, _ = expert_group(expert_tokens_reshaped)
+            expert_out = expert_out.view(-1, orig_shape[2]).to(expert_cache.dtype)
+            
+            expert_out.mul_(flat_l1_expert_weights[idxs[start_idx:end_idx]])
+            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+        
+        return expert_cache.view(*orig_shape)
+
+
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
@@ -345,7 +623,12 @@ class MiniMindBlock(nn.Module):
         self.layer_id = layer_id
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        if config.use_hierarchical_moe and config.use_moe:
+            self.mlp = HierarchicalMoE(config)
+        elif config.use_moe:
+            self.mlp = MOEFeedForward(config)
+        else:
+            self.mlp = FeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         residual = hidden_states
@@ -406,7 +689,7 @@ class MiniMindModel(nn.Module):
         aux_loss = sum(
             layer.mlp.aux_loss
             for layer in self.layers
-            if isinstance(layer.mlp, MOEFeedForward)
+            if isinstance(layer.mlp, (MOEFeedForward, HierarchicalMoE))
         )
 
         return hidden_states, presents, aux_loss

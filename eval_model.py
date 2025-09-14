@@ -19,7 +19,10 @@ def init_model(args):
         model = MiniMindForCausalLM(MiniMindConfig(
             hidden_size=args.hidden_size,
             num_hidden_layers=args.num_hidden_layers,
-            use_moe=args.use_moe
+            use_moe=args.use_moe,
+            use_hierarchical_moe=args.use_hierarchical_moe,
+            num_l1_experts=args.num_l1_experts,
+            num_l2_experts_per_group=args.num_l2_experts_per_group,
         ))
 
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
@@ -110,7 +113,10 @@ def main():
     parser.add_argument('--hidden_size', default=512, type=int)
     parser.add_argument('--num_hidden_layers', default=8, type=int)
     parser.add_argument('--max_seq_len', default=8192, type=int)
-    parser.add_argument('--use_moe', default=False, type=bool)
+    parser.add_argument('--use_moe', default=True, type=bool)
+    parser.add_argument('--use_hierarchical_moe', default=True, type=bool)
+    parser.add_argument('--num_l1_experts', default=4, type=int)
+    parser.add_argument('--num_l2_experts_per_group', default=4, type=int)
     # 携带历史对话上下文条数
     # history_cnt需要设为偶数，即【用户问题, 模型回答】为1组；设置为0时，即当前query不携带历史上文
     # 模型未经过外推微调时，在更长的上下文的chat_template时难免出现性能的明显退化，因此需要注意此处设置
