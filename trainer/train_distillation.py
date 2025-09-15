@@ -209,9 +209,7 @@ if __name__ == "__main__":
         hidden_size=512, 
         num_hidden_layers=8,
         use_moe=getattr(args, 'use_moe', False),
-        use_hierarchical_moe=getattr(args, 'use_hierarchical_moe', True),
-        num_l1_experts=getattr(args, 'num_l1_experts', 4),
-        num_l2_experts_per_group=getattr(args, 'num_l2_experts_per_group', 4)
+        
     )
     lm_config_teacher = MiniMindConfig(
         hidden_size=768, 
